@@ -61,6 +61,9 @@ impl Config {
             cmd.arg("--build").arg(gnu_target(&self.host));
             cmd.arg("--host").arg(gnu_target(&self.target));
         }
+        cmd.arg("--disable-shared");
+        cmd.arg("--enable-static");
+        cmd.arg("--with-pic");
         cmd.arg({
             let mut s = OsString::from("--prefix=");
             s.push(msys_compatible(&self.dst)?);
@@ -142,3 +145,4 @@ pub fn run(cmd: &mut Command) -> Result<String> {
 pub fn output(cmd: &mut Command) -> Result<String> {
     run(cmd.stdout(Stdio::piped()))
 }
+
