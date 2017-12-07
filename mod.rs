@@ -64,6 +64,7 @@ impl Config {
         }
         cmd.arg("--disable-dependency-tracking");
         cmd.arg("--enable-static");
+        cmd.arg("--disable-shared");
         cmd.arg("--with-pic");
         cmd.arg({
             let mut s = OsString::from("--prefix=");
