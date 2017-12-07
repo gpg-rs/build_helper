@@ -1,3 +1,4 @@
+use std::borrow::BorrowMut;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -61,7 +62,7 @@ impl Config {
             cmd.arg("--build").arg(gnu_target(&self.host));
             cmd.arg("--host").arg(gnu_target(&self.target));
         }
-        cmd.arg("--disable-shared");
+        cmd.arg("--disable-dependency-tracking");
         cmd.arg("--enable-static");
         cmd.arg("--with-pic");
         cmd.arg({
@@ -120,7 +121,11 @@ pub fn gnu_target(target: &str) -> String {
     }
 }
 
-pub fn run(cmd: &mut Command) -> Result<String> {
+pub fn run<C>(mut cmd: C) -> Result<String>
+where
+    C: BorrowMut<Command>,
+{
+    let cmd = cmd.borrow_mut();
     eprintln!("running: {:?}", cmd);
     match cmd.stdin(Stdio::null())
         .spawn()
@@ -142,7 +147,9 @@ pub fn run(cmd: &mut Command) -> Result<String> {
     }
 }
 
-pub fn output(cmd: &mut Command) -> Result<String> {
-    run(cmd.stdout(Stdio::piped()))
+pub fn output<C>(mut cmd: C) -> Result<String>
+where
+    C: BorrowMut<Command>,
+{
+    run(cmd.borrow_mut().stdout(Stdio::piped()))
 }
-
