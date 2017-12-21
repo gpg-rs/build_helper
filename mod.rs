@@ -9,7 +9,7 @@ use std::result;
 use std::str;
 use std::sync::{Once, ONCE_INIT};
 
-use gcc;
+use cc;
 
 pub type Result<T> = result::Result<T, ()>;
 
@@ -121,7 +121,7 @@ pub fn gnu_target(target: &str) -> String {
 }
 
 pub struct Config {
-    pub compiler: gcc::Tool,
+    pub compiler: cc::Tool,
     pub src: PathBuf,
     pub dst: PathBuf,
     pub build: PathBuf,
@@ -129,7 +129,7 @@ pub struct Config {
 
 impl Config {
     pub fn new<S: AsRef<OsStr>>(name: S) -> Result<Config> {
-        let compiler = gcc::Build::new().get_compiler();
+        let compiler = cc::Build::new().get_compiler();
         let src = PathBuf::from(env::current_dir().unwrap()).join(name.as_ref());
         let dst = out_dir().to_owned();
         let mut build = dst.join("build");
@@ -147,19 +147,10 @@ impl Config {
     }
 
     pub fn configure(&self) -> Result<Command> {
-        let cflags = self.compiler
-            .args()
-            .iter()
-            .fold(OsString::new(), |mut c, a| {
-                c.push(a);
-                c.push(" ");
-                c
-            });
-
         let mut cmd = Command::new("sh");
         cmd.current_dir(&self.build)
-            .env("CC", self.compiler.path())
-            .env("CFLAGS", &cflags)
+            .env("CC", self.compiler.cc_env())
+            .env("CFLAGS", self.compiler.cflags_env())
             .arg(msys_compatible(self.src.join("configure"))?);
         if host() != target() {
             cmd.arg("--build").arg(gnu_target(host()));
