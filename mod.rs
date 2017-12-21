@@ -148,8 +148,12 @@ impl Config {
 
     pub fn configure(&self) -> Result<Command> {
         let mut cmd = Command::new("sh");
+        let mut cc = self.compiler.cc_env();
+        if cc.is_empty() {
+            cc = self.compiler.path().as_os_str().to_owned();
+        }
         cmd.current_dir(&self.build)
-            .env("CC", self.compiler.cc_env())
+            .env("CC", cc)
             .env("CFLAGS", self.compiler.cflags_env())
             .arg(msys_compatible(self.src.join("configure"))?);
         if host() != target() {
