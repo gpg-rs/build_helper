@@ -195,6 +195,21 @@ impl Config {
 
 pub fn parse_libtool_file<P: AsRef<Path>>(path: P) -> Result<()> {
     for_each_line(path, |l| {
+        if l.trim().starts_with("old_library") {
+            if let Some(s) = l.splitn(2, '=').nth(1) {
+                let mut s = s.trim().trim_matches('\'');
+                if s.ends_with(".a") {
+                    if s.starts_with("lib") {
+                        s = s.split_at(3).1;
+                    }
+                    s = s.split_at(s.len() - 2).0;
+                }
+
+                if !s.is_empty() {
+                    println!("cargo:rustc-link-lib=static={}", s);
+                }
+            }
+        }
         if l.trim().starts_with("dependency_libs") {
             if let Some(s) = l.splitn(2, '=').nth(1) {
                 parse_linker_flags(s.trim().trim_matches('\''))
@@ -204,11 +219,11 @@ pub fn parse_libtool_file<P: AsRef<Path>>(path: P) -> Result<()> {
 }
 
 pub fn parse_linker_flags(flags: &str) {
-    let parts = flags.split(|c: char| c.is_whitespace()).filter_map(|p| {
-        if p.len() > 2 {
-            Some(p.split_at(2))
+    let parts = flags.split(|c: char| c.is_whitespace()).map(|p| {
+        if p.starts_with("-") && (p.len() > 2) {
+            p.split_at(2)
         } else {
-            None
+            ("", p)
         }
     });
 
@@ -220,8 +235,12 @@ pub fn parse_linker_flags(flags: &str) {
             "-F" => {
                 println!("cargo:rustc-link-search=framework={}", val);
             }
-            "-l" => {
-                println!("cargo:rustc-link-lib={}", val);
+            "-l" | "" if !val.is_empty() => {
+                if val.ends_with(".la") {
+                    parse_libtool_file(val).unwrap();
+                } else {
+                    println!("cargo:rustc-link-lib={}", val);
+                }
             }
             _ => (),
         }
