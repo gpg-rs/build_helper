@@ -1,103 +1,78 @@
 use std::borrow::BorrowMut;
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 use std::result;
 use std::str;
-use std::sync::{Once, ONCE_INIT};
 
 use cc;
 
+macro_rules! scan {
+    ($string:expr, $sep:expr; $($x:ty),+) => ({
+        let mut iter = $string.split($sep);
+        ($(iter.next().and_then(|word| word.parse::<$x>().ok()),)*)
+    });
+    ($string:expr; $($x:ty),+) => (
+        scan!($string, char::is_whitespace; $($x),+)
+    );
+}
+
 pub type Result<T> = result::Result<T, ()>;
 
-macro_rules! lazy {
-    ($t:ty: $e:expr) => ({
-        use std::mem::ManuallyDrop;
-        static INIT: Once = ONCE_INIT;
-        static mut VALUE: Option<ManuallyDrop<$t>> = None;
-        INIT.call_once(|| {
-            let r = $e;
-            unsafe {
-                VALUE = Some(ManuallyDrop::new(r));
-            }
-        });
-        unsafe {
-            VALUE.as_ref().unwrap()
-        }
-    });
+pub trait ContextExt<T> {
+    fn context<D: fmt::Display>(self, msg: D) -> Result<T>;
 }
 
-pub fn host() -> &'static str {
-    lazy!(String: env::var("HOST").unwrap())
+impl<T, E: fmt::Display> ContextExt<T> for result::Result<T, E> {
+    fn context<D: fmt::Display>(self, msg: D) -> Result<T> {
+        self.map_err(|e| eprintln!("{}: {}", msg, e))
+    }
 }
 
-pub fn target() -> &'static str {
-    lazy!(String: env::var("TARGET").unwrap())
+impl<T> ContextExt<T> for Option<T> {
+    fn context<D: fmt::Display>(self, msg: D) -> Result<T> {
+        self.ok_or_else(|| eprintln!("{}", msg))
+    }
 }
 
-pub fn out_dir() -> &'static Path {
-    lazy!(PathBuf: PathBuf::from(env::var_os("OUT_DIR").unwrap()))
-}
-
-pub fn get_env(name: &str) -> Option<OsString> {
+pub fn get_env<S: AsRef<str>>(name: S) -> Option<OsString> {
+    let name = name.as_ref();
     println!("cargo:rerun-if-env-changed={}", name);
     env::var_os(name)
 }
 
-pub fn for_each_line<P: AsRef<Path>, F: FnMut(&str)>(path: P, mut f: F) -> Result<()> {
-    let mut file = BufReader::new(File::open(path).or(Err(()))?);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if file.read_line(&mut line).or(Err(()))? == 0 {
-            return Ok(());
-        }
-        f(&line);
+// Based on cmake boolean variables
+pub fn is_truthy<S: AsRef<OsStr>>(value: S) -> bool {
+    let value = value.as_ref();
+    if value.is_empty() {
+        return false;
     }
+    let s = match value.to_str() {
+        Some(s) => s,
+        None => return true,
+    };
+    !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no")
+        && !s.eq_ignore_ascii_case("off")
 }
 
-pub fn run<C>(mut cmd: C) -> Result<String>
-where C: BorrowMut<Command> {
-    let cmd = cmd.borrow_mut();
-    eprintln!("running: {:?}", cmd);
-    match cmd.stdin(Stdio::null())
-        .spawn()
-        .and_then(|c| c.wait_with_output())
-    {
-        Ok(output) => if output.status.success() {
-            String::from_utf8(output.stdout).or(Err(()))
-        } else {
-            eprintln!(
-                "command did not execute successfully, got: {}",
-                output.status
-            );
-            Err(())
-        },
-        Err(e) => {
-            eprintln!("failed to execute command: {}", e);
-            Err(())
-        }
-    }
-}
-
-pub fn output<C>(mut cmd: C) -> Result<String>
-where C: BorrowMut<Command> {
-    run(cmd.borrow_mut().stdout(Stdio::piped()))
+pub fn make_env_name<S: AsRef<str>>(value: S) -> String {
+    let mut value = value.as_ref().replace('-', "_");
+    value.make_ascii_uppercase();
+    value
 }
 
 pub fn msys_compatible<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
-    use std::ascii::AsciiExt;
-
     if !cfg!(windows) {
         return Ok(path.as_ref().to_owned());
     }
 
     let mut path = path.as_ref()
         .to_str()
-        .ok_or_else(|| eprintln!("path is not valid utf-8"))?
+        .context("path is not valid utf-8")?
         .to_owned();
     if let Some(b'a'...b'z') = path.as_bytes().first().map(u8::to_ascii_lowercase) {
         if path.split_at(1).1.starts_with(":\\") {
@@ -120,45 +95,296 @@ pub fn gnu_target(target: &str) -> String {
     }
 }
 
+pub fn for_each_line<P, F>(path: P, mut f: F) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: FnMut(&str) -> Result<()>, {
+    let path = path.as_ref();
+    let mut file = BufReader::new(File::open(path).context(format_args!("failed to open file: {}", path.display()))?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if file.read_line(&mut line).or(Err(()))? == 0 {
+            return Ok(());
+        }
+        f(&line)?;
+    }
+}
+
+pub fn run<C>(mut cmd: C) -> Result<String>
+where C: BorrowMut<Command> {
+    let cmd = cmd.borrow_mut();
+    eprintln!("running: {:?}", cmd);
+    let output = cmd.stdin(Stdio::null())
+        .spawn()
+        .and_then(|c| c.wait_with_output())
+        .context("failed to execute command")?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).or(Err(()))
+    } else {
+        eprintln!(
+            "command did not execute successfully, got: {}",
+            output.status
+        );
+        Err(())
+    }
+}
+
+pub fn output<C>(mut cmd: C) -> Result<String>
+where C: BorrowMut<Command> {
+    run(cmd.borrow_mut().stdout(Stdio::piped()))
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub compiler: cc::Tool,
-    pub src: PathBuf,
-    pub dst: PathBuf,
-    pub build: PathBuf,
+    pub version: Option<String>,
+    pub root: Option<OsString>,
+    pub include_dir: Vec<OsString>,
+    pub lib_dir: Vec<OsString>,
+    pub libs: Vec<OsString>,
+    pub statik: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: None,
+            root: None,
+            include_dir: Vec::default(),
+            lib_dir: Vec::default(),
+            libs: Vec::default(),
+            statik: false,
+        }
+    }
 }
 
 impl Config {
-    pub fn new<S: AsRef<OsStr>>(name: S) -> Result<Config> {
+
+    pub fn parse_flags(&mut self, flags: &str) -> Result<()> {
+        let parts = flags.split(|c: char| c.is_ascii_whitespace()).map(|p| {
+            if p.starts_with("-") && (p.len() > 2) {
+                p.split_at(2)
+            } else {
+                ("", p)
+            }
+        });
+
+        for (flag, val) in parts {
+            match flag {
+                "-I" => {
+                    self.include_dir.push(val.into());
+                }
+                "-L" => {
+                    self.lib_dir.push(val.into());
+                }
+                "-l" | "" if !val.is_empty() => {
+                    if val.ends_with(".la") {
+                        self.parse_libtool_file(val)?;
+                    } else {
+                        self.libs.push(val.into());
+                    }
+                }
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parse_libtool_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        for_each_line(path, |l| {
+            if l.trim().starts_with("old_library") {
+                if let Some(s) = l.splitn(2, '=').nth(1) {
+                    let mut s = s.trim().trim_matches('\'');
+                    if s.ends_with(".a") {
+                        if s.starts_with("lib") {
+                            s = s.split_at(3).1;
+                        }
+                        s = s.split_at(s.len() - 2).0;
+                    }
+
+                    if !s.is_empty() {
+                        self.libs.push(format!("static={}", s).into());
+                    }
+                }
+            }
+            if l.trim().starts_with("dependency_libs") {
+                if let Some(s) = l.splitn(2, '=').nth(1) {
+                    self.parse_flags(s.trim().trim_matches('\''))?
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn print(&self) {
+        if let Some(ref v) = self.version {
+            println!("cargo:version={}", v);
+        }
+        if let Some(ref v) = self.root {
+            println!("cargo:root={}", v.to_string_lossy());
+        }
+        if !self.include_dir.is_empty() {
+            println!(
+                "cargo:include={}",
+                env::join_paths(&self.include_dir)
+                    .unwrap()
+                    .to_string_lossy()
+            );
+        }
+        if !self.lib_dir.is_empty() {
+            println!(
+                "cargo:lib_dir={}",
+                env::join_paths(&self.lib_dir).unwrap().to_string_lossy()
+            );
+            for dir in &self.lib_dir {
+                println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
+            }
+        } else if let Some(ref v) = self.root {
+            println!("cargo:rustc-link-search=native={}/lib", v.to_string_lossy())
+        }
+        if !self.libs.is_empty() {
+            println!(
+                "cargo:libs={}",
+                env::join_paths(&self.libs).unwrap().to_string_lossy()
+            );
+            let mode = if self.statik { "static=" } else { "" };
+            for lib in &self.libs {
+                println!("cargo:rustc-link-lib={}{}", mode, lib.to_string_lossy())
+            }
+        }
+    }
+}
+
+pub struct Project {
+    pub name: String,
+    pub prefix: String,
+    pub links: Option<String>,
+    pub compiler: cc::Tool,
+    pub host: String,
+    pub target: String,
+    pub out_dir: PathBuf,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        let name = {
+            let mut name = env::var("CARGO_PKG_NAME").unwrap();
+            if name.ends_with("-sys") {
+                let len = name.len() - 4;
+                name.truncate(len);
+            }
+            name
+        };
+        let prefix = make_env_name(&name);
+        let links = env::var("CARGO_MANIFEST_LINKS").ok();
         let compiler = cc::Build::new().get_compiler();
+        let host = env::var("HOST").unwrap();
+        let target = env::var("TARGET").unwrap();
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        Self {
+            name,
+            prefix,
+            links,
+            compiler,
+            host,
+            target,
+            out_dir,
+        }
+    }
+}
+
+impl Project {
+    pub fn configure<F: FnOnce(&Self) -> Result<Config>>(&self, f: F) {
+        match f(self) {
+            Ok(cfg) => cfg.print(),
+            Err(_) => process::exit(1),
+        }
+    }
+
+    pub fn try_env(&self) -> Result<Config> {
+        let include_dir = get_env(self.prefix.clone() + "_INCLUDE");
+        let lib_dir = get_env(self.prefix.clone() + "_LIB_DIR");
+        let libs = get_env(self.prefix.clone() + "_LIBS");
+        if libs.is_some() || lib_dir.is_some() {
+            let statik = get_env(self.prefix.clone() + "_STATIC").map_or(false, |s| is_truthy(s));
+            let include_dir = include_dir.iter().flat_map(env::split_paths).map(|x| x.into()).collect();
+            let lib_dir = lib_dir.iter().flat_map(env::split_paths).map(|x| x.into()).collect();
+            let libs = libs.as_ref()
+                .map(|s| &**s)
+                .or_else(|| self.links.as_ref().map(|s| s.as_ref()))
+                .unwrap_or(self.name.as_ref());
+            let libs = env::split_paths(libs).map(|x| x.into()).collect();
+            Ok(Config {
+                include_dir,
+                lib_dir,
+                libs,
+                statik,
+                ..Config::default()
+            })
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn try_config<C>(&self, cmd: C) -> Result<Config>
+    where C: BorrowMut<Command> {
+        let output = output(cmd)?;
+        let mut config = Config::default();
+        config.parse_flags(&output)?;
+        Ok(config)
+    }
+
+    pub fn try_build<F>(&self, f: F) -> Result<Config>
+    where F: FnOnce(&Self) -> Result<Config> {
+        if get_env(self.prefix.clone() + "_USE_BUNDLED").map_or(cfg!(feature = "bundled"), |s| is_truthy(s)) {
+            let _ = run(Command::new("git").args(&["submodule", "update", "--init"]));
+
+            if let r @ Ok(_) = f(self) {
+                return r;
+            }
+        }
+        Err(())
+    }
+
+    pub fn new_build<S: AsRef<OsStr>>(&self, name: S) -> Result<Build> {
+        Build::new(self, name)
+    }
+}
+
+pub struct Build<'a> {
+    pub project: &'a Project,
+    pub src: PathBuf,
+    pub build: PathBuf,
+}
+
+impl<'a> Build<'a> {
+    pub fn new<S: AsRef<OsStr>>(project: &'a Project, name: S) -> Result<Self> {
         let src = PathBuf::from(env::current_dir().unwrap()).join(name.as_ref());
-        let dst = out_dir().to_owned();
-        let mut build = dst.join("build");
+        let mut build = project.out_dir.join("build");
         build.push(name.as_ref());
 
-        fs::create_dir_all(&build)
-            .map_err(|e| eprintln!("unable to create build directory: {}", e))?;
+        fs::create_dir_all(&build).context("unable to create build directory")?;
 
-        Ok(Config {
-            compiler,
+        Ok(Self {
+            project,
             src,
-            dst,
             build,
         })
     }
 
     pub fn configure(&self) -> Result<Command> {
         let mut cmd = Command::new("sh");
-        let mut cc = self.compiler.cc_env();
+        let mut cc = self.project.compiler.cc_env();
         if cc.is_empty() {
-            cc = self.compiler.path().as_os_str().to_owned();
+            cc = self.project.compiler.path().as_os_str().to_owned();
         }
         cmd.current_dir(&self.build)
             .env("CC", cc)
-            .env("CFLAGS", self.compiler.cflags_env())
+            .env("CFLAGS", self.project.compiler.cflags_env())
             .arg(msys_compatible(self.src.join("configure"))?);
-        if host() != target() {
-            cmd.arg("--build").arg(gnu_target(host()));
-            cmd.arg("--host").arg(gnu_target(target()));
+        if self.project.host != self.project.target {
+            cmd.arg("--build").arg(gnu_target(&self.project.host));
+            cmd.arg("--host").arg(gnu_target(&self.project.target));
         }
         cmd.arg("--disable-dependency-tracking");
         cmd.arg("--enable-static");
@@ -166,7 +392,7 @@ impl Config {
         cmd.arg("--with-pic");
         cmd.arg({
             let mut s = OsString::from("--prefix=");
-            s.push(msys_compatible(&self.dst)?);
+            s.push(msys_compatible(&self.project.out_dir)?);
             s
         });
         Ok(cmd)
@@ -185,59 +411,5 @@ impl Config {
         }
         cmd.current_dir(&self.build);
         cmd
-    }
-}
-
-pub fn parse_libtool_file<P: AsRef<Path>>(path: P) -> Result<()> {
-    for_each_line(path, |l| {
-        if l.trim().starts_with("old_library") {
-            if let Some(s) = l.splitn(2, '=').nth(1) {
-                let mut s = s.trim().trim_matches('\'');
-                if s.ends_with(".a") {
-                    if s.starts_with("lib") {
-                        s = s.split_at(3).1;
-                    }
-                    s = s.split_at(s.len() - 2).0;
-                }
-
-                if !s.is_empty() {
-                    println!("cargo:rustc-link-lib=static={}", s);
-                }
-            }
-        }
-        if l.trim().starts_with("dependency_libs") {
-            if let Some(s) = l.splitn(2, '=').nth(1) {
-                parse_linker_flags(s.trim().trim_matches('\''))
-            }
-        }
-    })
-}
-
-pub fn parse_linker_flags(flags: &str) {
-    let parts = flags.split(|c: char| c.is_whitespace()).map(|p| {
-        if p.starts_with("-") && (p.len() > 2) {
-            p.split_at(2)
-        } else {
-            ("", p)
-        }
-    });
-
-    for (flag, val) in parts {
-        match flag {
-            "-L" => {
-                println!("cargo:rustc-link-search=native={}", val);
-            }
-            "-F" => {
-                println!("cargo:rustc-link-search=framework={}", val);
-            }
-            "-l" | "" if !val.is_empty() => {
-                if val.ends_with(".la") {
-                    parse_libtool_file(val).unwrap();
-                } else {
-                    println!("cargo:rustc-link-lib={}", val);
-                }
-            }
-            _ => (),
-        }
     }
 }
