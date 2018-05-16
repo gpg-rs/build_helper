@@ -1,9 +1,10 @@
 use std::borrow::BorrowMut;
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::result;
@@ -138,10 +139,10 @@ where C: BorrowMut<Command> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: Option<String>,
-    pub root: Option<OsString>,
-    pub include_dir: Vec<OsString>,
-    pub lib_dir: Vec<OsString>,
-    pub libs: Vec<OsString>,
+    pub root: Option<PathBuf>,
+    pub include_dir: HashSet<PathBuf>,
+    pub lib_dir: HashSet<PathBuf>,
+    pub libs: HashSet<OsString>,
     pub statik: bool,
 }
 
@@ -150,15 +151,66 @@ impl Default for Config {
         Self {
             version: None,
             root: None,
-            include_dir: Vec::default(),
-            lib_dir: Vec::default(),
-            libs: Vec::default(),
+            include_dir: HashSet::default(),
+            lib_dir: HashSet::default(),
+            libs: HashSet::default(),
             statik: false,
         }
     }
 }
 
 impl Config {
+    pub fn from_root(root: PathBuf) -> Self {
+        let mut config = Self {
+            root: Some(root.clone()),
+            ..Self::default()
+        };
+        let include = root.join("include");
+        if include.exists() {
+            config.include_dir.insert(include);
+        }
+        let lib = root.join("lib");
+        if lib.exists() {
+            config.lib_dir.insert(lib);
+        }
+        config
+    }
+
+    pub fn try_detect_version(&mut self, header: &str, prefix: &str) -> Result<()> {
+        eprintln!("detecting installed version of libgcrypt");
+        let defaults = &["/usr/include".as_ref(), "/usr/local/include".as_ref()];
+        for dir in self.include_dir.iter().map(|x| Path::new(x)).chain(self.root.iter().map(|x| x.as_ref())).chain(defaults.iter().cloned()) {
+            let name = dir.join(header);
+            let mut file = match File::open(name.clone()) {
+                Ok(f) => BufReader::new(f),
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        eprintln!("skipping non-existent file: {}", name.display());
+                    } else {
+                        eprintln!("unable to inspect file `{}`: {}", name.display(), e);
+                    }
+                    continue;
+                }
+            };
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if file.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+
+                if let Some(p) = line.find(prefix) {
+                    if let Some(v) = (&line[p..]).split('\"').nth(1) {
+                        eprintln!("found version: {} in {}", v, name.display());
+                        self.version = Some(v.trim().into());
+                        return Ok(());
+                    }
+                    break;
+                }
+            }
+        }
+        Err(())
+    }
 
     pub fn parse_flags(&mut self, flags: &str) -> Result<()> {
         let parts = flags.split(|c: char| c.is_ascii_whitespace()).map(|p| {
@@ -172,16 +224,16 @@ impl Config {
         for (flag, val) in parts {
             match flag {
                 "-I" => {
-                    self.include_dir.push(val.into());
+                    self.include_dir.insert(val.into());
                 }
                 "-L" => {
-                    self.lib_dir.push(val.into());
+                    self.lib_dir.insert(val.into());
                 }
                 "-l" | "" if !val.is_empty() => {
                     if val.ends_with(".la") {
                         self.parse_libtool_file(val)?;
                     } else {
-                        self.libs.push(val.into());
+                        self.libs.insert(val.into());
                     }
                 }
                 _ => (),
@@ -203,7 +255,7 @@ impl Config {
                     }
 
                     if !s.is_empty() {
-                        self.libs.push(format!("static={}", s).into());
+                        self.libs.insert(format!("static={}", s).into());
                     }
                 }
             }
@@ -221,7 +273,7 @@ impl Config {
             println!("cargo:version={}", v);
         }
         if let Some(ref v) = self.root {
-            println!("cargo:root={}", v.to_string_lossy());
+            println!("cargo:root={}", v.display());
         }
         if !self.include_dir.is_empty() {
             println!(
@@ -230,6 +282,8 @@ impl Config {
                     .unwrap()
                     .to_string_lossy()
             );
+        } else if let Some(ref v) = self.root {
+            println!("cargo:include={}/include", v.display())
         }
         if !self.lib_dir.is_empty() {
             println!(
@@ -240,16 +294,20 @@ impl Config {
                 println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
             }
         } else if let Some(ref v) = self.root {
-            println!("cargo:rustc-link-search=native={}/lib", v.to_string_lossy())
+            println!("cargo:rustc-link-search=native={}/lib", v.display())
         }
         if !self.libs.is_empty() {
             println!(
                 "cargo:libs={}",
                 env::join_paths(&self.libs).unwrap().to_string_lossy()
             );
-            let mode = if self.statik { "static=" } else { "" };
+            let default_mode = if self.statik { "static=" } else { "" };
             for lib in &self.libs {
-                println!("cargo:rustc-link-lib={}{}", mode, lib.to_string_lossy())
+                let lib = lib.to_string_lossy();
+                let mode = if lib.starts_with("static=") || lib.starts_with("dynamic=") {
+                    ""
+                } else { default_mode };
+                println!("cargo:rustc-link-lib={}{}", mode, lib)
             }
         }
     }
@@ -372,7 +430,13 @@ impl<'a> Build<'a> {
         })
     }
 
-    pub fn configure(&self) -> Result<Command> {
+    pub fn config(&self) -> Config {
+        let mut config = Config::from_root(self.project.out_dir.clone().into());
+        config.statik = true;
+        config
+    }
+
+    pub fn configure_cmd(&self) -> Result<Command> {
         let mut cmd = Command::new("sh");
         let mut cc = self.project.compiler.cc_env();
         if cc.is_empty() {
@@ -398,7 +462,7 @@ impl<'a> Build<'a> {
         Ok(cmd)
     }
 
-    pub fn make(&self) -> Command {
+    pub fn make_cmd(&self) -> Command {
         let name = if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
             "gmake"
         } else {
