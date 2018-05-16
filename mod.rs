@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::env;
@@ -431,9 +432,7 @@ impl<'a> Build<'a> {
     }
 
     pub fn config(&self) -> Config {
-        let mut config = Config::from_root(self.project.out_dir.clone().into());
-        config.statik = true;
-        config
+        Config::from_root(self.project.out_dir.clone().into())
     }
 
     pub fn configure_cmd(&self) -> Result<Command> {
