@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unused_macros)]
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::env;
@@ -84,6 +85,21 @@ pub fn msys_compatible<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
         }
     }
     Ok(path.replace("\\", "/").into())
+}
+
+pub fn native_path<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
+    if !cfg!(windows) {
+        return Ok(path.as_ref().to_owned());
+    }
+
+    let mut path = path.as_ref().to_str().context("path is not valid utf-8")?.to_owned();
+    if path.starts_with('/') && (path.as_bytes().get(2) == Some(&b'/')) {
+        if let Some(b'a'...b'z') = path.as_bytes().get(1) {
+            path.remove(0);
+            path.insert(1, ':');
+        }
+    }
+    Ok(path.into())
 }
 
 pub fn gnu_target(target: &str) -> String {
@@ -225,16 +241,16 @@ impl Config {
         for (flag, val) in parts {
             match flag {
                 "-I" => {
-                    self.include_dir.insert(val.into());
+                    self.include_dir.insert(native_path(val)?.into());
                 }
                 "-L" => {
-                    self.lib_dir.insert(val.into());
+                    self.lib_dir.insert(native_path(val)?.into());
                 }
                 "-l" | "" if !val.is_empty() => {
                     if val.ends_with(".la") {
-                        self.parse_libtool_file(val)?;
+                        self.parse_libtool_file(native_path(val)?)?;
                     } else {
-                        self.libs.insert(val.into());
+                        self.libs.insert(native_path(val)?);
                     }
                 }
                 _ => (),
