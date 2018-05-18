@@ -30,9 +30,9 @@ pub trait ContextExt<T> {
     fn context<D: fmt::Display>(self, msg: D) -> Result<T>;
 }
 
-impl<T, E: fmt::Display> ContextExt<T> for result::Result<T, E> {
+impl<T, E: fmt::Debug> ContextExt<T> for result::Result<T, E> {
     fn context<D: fmt::Display>(self, msg: D) -> Result<T> {
-        self.map_err(|e| eprintln!("{}: {}", msg, e))
+        self.map_err(|e| eprintln!("{}: {:?}", msg, e))
     }
 }
 
