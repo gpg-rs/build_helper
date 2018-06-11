@@ -58,7 +58,8 @@ pub fn is_truthy<S: AsRef<OsStr>>(value: S) -> bool {
         Some(s) => s,
         None => return true,
     };
-    !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("no")
+    !s.eq_ignore_ascii_case("false")
+        && !s.eq_ignore_ascii_case("no")
         && !s.eq_ignore_ascii_case("off")
 }
 
@@ -68,12 +69,13 @@ pub fn make_env_name<S: AsRef<str>>(value: S) -> String {
     value
 }
 
-pub fn msys_compatible<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
+pub fn msys_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(path.as_ref().to_owned());
     }
 
-    let mut path = path.as_ref()
+    let mut path = path
+        .as_ref()
         .to_str()
         .context("path is not valid utf-8")?
         .to_owned();
@@ -87,12 +89,16 @@ pub fn msys_compatible<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
     Ok(path.replace("\\", "/").into())
 }
 
-pub fn native_path<P: AsRef<OsStr>>(path: P) -> Result<OsString> {
+pub fn native_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(path.as_ref().to_owned());
     }
 
-    let mut path = path.as_ref().to_str().context("path is not valid utf-8")?.to_owned();
+    let mut path = path
+        .as_ref()
+        .to_str()
+        .context("path is not valid utf-8")?
+        .to_owned();
     if path.starts_with('/') && (path.as_bytes().get(2) == Some(&b'/')) {
         if let Some(b'a'...b'z') = path.as_bytes().get(1) {
             path.remove(0);
@@ -118,7 +124,9 @@ where
     P: AsRef<Path>,
     F: FnMut(&str) -> Result<()>, {
     let path = path.as_ref();
-    let mut file = BufReader::new(File::open(path).context(format_args!("failed to open file: {}", path.display()))?);
+    let mut file = BufReader::new(
+        File::open(path).context(format_args!("failed to open file: {}", path.display()))?,
+    );
     let mut line = String::new();
     loop {
         line.clear();
@@ -133,7 +141,8 @@ pub fn run<C>(mut cmd: C) -> Result<String>
 where C: BorrowMut<Command> {
     let cmd = cmd.borrow_mut();
     eprintln!("running: {:?}", cmd);
-    let output = cmd.stdin(Stdio::null())
+    let output = cmd
+        .stdin(Stdio::null())
         .spawn()
         .and_then(|c| c.wait_with_output())
         .context("failed to execute command")?;
@@ -196,7 +205,13 @@ impl Config {
     pub fn try_detect_version(&mut self, header: &str, prefix: &str) -> Result<()> {
         eprintln!("detecting installed version of libgcrypt");
         let defaults = &["/usr/include".as_ref(), "/usr/local/include".as_ref()];
-        for dir in self.include_dir.iter().map(|x| Path::new(x)).chain(self.root.iter().map(|x| x.as_ref())).chain(defaults.iter().cloned()) {
+        for dir in self
+            .include_dir
+            .iter()
+            .map(|x| Path::new(x))
+            .chain(self.root.iter().map(|x| x.as_ref()))
+            .chain(defaults.iter().cloned())
+        {
             let name = dir.join(header);
             let mut file = match File::open(name.clone()) {
                 Ok(f) => BufReader::new(f),
@@ -250,7 +265,7 @@ impl Config {
                     if val.ends_with(".la") {
                         self.parse_libtool_file(native_path(val)?)?;
                     } else {
-                        self.libs.insert(native_path(val)?);
+                        self.libs.insert(native_path(val)?.into());
                     }
                 }
                 _ => (),
@@ -323,7 +338,9 @@ impl Config {
                 let lib = lib.to_string_lossy();
                 let mode = if lib.starts_with("static=") || lib.starts_with("dynamic=") {
                     ""
-                } else { default_mode };
+                } else {
+                    default_mode
+                };
                 println!("cargo:rustc-link-lib={}{}", mode, lib)
             }
         }
@@ -382,9 +399,18 @@ impl Project {
         let libs = get_env(self.prefix.clone() + "_LIBS");
         if libs.is_some() || lib_dir.is_some() {
             let statik = get_env(self.prefix.clone() + "_STATIC").map_or(false, |s| is_truthy(s));
-            let include_dir = include_dir.iter().flat_map(env::split_paths).map(|x| x.into()).collect();
-            let lib_dir = lib_dir.iter().flat_map(env::split_paths).map(|x| x.into()).collect();
-            let libs = libs.as_ref()
+            let include_dir = include_dir
+                .iter()
+                .flat_map(env::split_paths)
+                .map(|x| x.into())
+                .collect();
+            let lib_dir = lib_dir
+                .iter()
+                .flat_map(env::split_paths)
+                .map(|x| x.into())
+                .collect();
+            let libs = libs
+                .as_ref()
                 .map(|s| &**s)
                 .or_else(|| self.links.as_ref().map(|s| s.as_ref()))
                 .unwrap_or(self.name.as_ref());
@@ -411,7 +437,9 @@ impl Project {
 
     pub fn try_build<F>(&self, f: F) -> Result<Config>
     where F: FnOnce(&Self) -> Result<Config> {
-        if get_env(self.prefix.clone() + "_USE_BUNDLED").map_or(cfg!(feature = "bundled"), |s| is_truthy(s)) {
+        if get_env(self.prefix.clone() + "_USE_BUNDLED")
+            .map_or(cfg!(feature = "bundled"), |s| is_truthy(s))
+        {
             let _ = run(Command::new("git").args(&["submodule", "update", "--init"]));
 
             if let r @ Ok(_) = f(self) {
@@ -460,9 +488,9 @@ impl<'a> Build<'a> {
         cmd.current_dir(&self.build)
             .env("CC", cc)
             .env("CFLAGS", self.project.compiler.cflags_env())
-            .arg(msys_compatible(self.src.join("configure"))?);
+            .arg(msys_path(self.src.join("configure"))?);
+        cmd.arg("--build").arg(gnu_target(&self.project.host));
         if self.project.host != self.project.target {
-            cmd.arg("--build").arg(gnu_target(&self.project.host));
             cmd.arg("--host").arg(gnu_target(&self.project.target));
         }
         cmd.arg("--disable-dependency-tracking");
@@ -471,7 +499,7 @@ impl<'a> Build<'a> {
         cmd.arg("--with-pic");
         cmd.arg({
             let mut s = OsString::from("--prefix=");
-            s.push(msys_compatible(&self.project.out_dir)?);
+            s.push(msys_path(&self.project.out_dir)?);
             s
         });
         Ok(cmd)
