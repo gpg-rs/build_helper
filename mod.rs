@@ -1,18 +1,18 @@
 #![allow(dead_code)]
 #![allow(unused_macros)]
-use std::borrow::BorrowMut;
-use std::collections::HashSet;
-use std::env;
-use std::ffi::{OsStr, OsString};
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
-use std::result;
-use std::str;
-
 use cc;
+use std::{
+    borrow::BorrowMut,
+    collections::HashSet,
+    env,
+    ffi::{OsStr, OsString},
+    fmt,
+    fs::{self, File},
+    io::{self, BufRead, BufReader},
+    path::{Path, PathBuf},
+    process::{self, Command, Stdio},
+    result, str,
+};
 
 macro_rules! scan {
     ($string:expr, $sep:expr; $($x:ty),+) => ({
