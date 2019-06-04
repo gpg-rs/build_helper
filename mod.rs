@@ -1,16 +1,15 @@
 #![allow(dead_code)]
 #![allow(unused_macros)]
-use cc;
 use std::{
     borrow::BorrowMut,
     collections::HashSet,
     env,
     ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File},
+    fs::File,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{self, Command, Stdio},
+    process::{Command, Stdio},
     result, str,
 };
 
@@ -24,20 +23,26 @@ macro_rules! scan {
     );
 }
 
-pub type Result<T> = result::Result<T, ()>;
-
-pub trait ContextExt<T> {
-    fn context<D: fmt::Display>(self, msg: D) -> Result<T>;
+macro_rules! warn_err {
+    ($res:expr, $msg:expr $(,$args:expr)*) => {
+        $res.warn_err(format_args!($msg $(,$args)*))
+    };
 }
 
-impl<T, E: fmt::Debug> ContextExt<T> for result::Result<T, E> {
-    fn context<D: fmt::Display>(self, msg: D) -> Result<T> {
+pub type Result<T> = result::Result<T, ()>;
+
+pub trait ResultExt<T> {
+    fn warn_err<D: fmt::Display>(self, msg: D) -> Result<T>;
+}
+
+impl<T, E: fmt::Debug> ResultExt<T> for result::Result<T, E> {
+    fn warn_err<D: fmt::Display>(self, msg: D) -> Result<T> {
         self.map_err(|e| eprintln!("{}: {:?}", msg, e))
     }
 }
 
-impl<T> ContextExt<T> for Option<T> {
-    fn context<D: fmt::Display>(self, msg: D) -> Result<T> {
+impl<T> ResultExt<T> for Option<T> {
+    fn warn_err<D: fmt::Display>(self, msg: D) -> Result<T> {
         self.ok_or_else(|| eprintln!("{}", msg))
     }
 }
@@ -69,26 +74,6 @@ pub fn make_env_name<S: AsRef<str>>(value: S) -> String {
     value
 }
 
-pub fn msys_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
-    if !cfg!(windows) {
-        return Ok(path.as_ref().to_owned());
-    }
-
-    let mut path = path
-        .as_ref()
-        .to_str()
-        .context("path is not valid utf-8")?
-        .to_owned();
-    if let Some(b'a'...b'z') = path.as_bytes().first().map(u8::to_ascii_lowercase) {
-        if path.split_at(1).1.starts_with(":\\") {
-            (&mut path[..1]).make_ascii_lowercase();
-            path.remove(1);
-            path.insert(0, '/');
-        }
-    }
-    Ok(path.replace("\\", "/").into())
-}
-
 pub fn native_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(path.as_ref().to_owned());
@@ -97,10 +82,10 @@ pub fn native_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     let mut path = path
         .as_ref()
         .to_str()
-        .context("path is not valid utf-8")?
+        .warn_err("path is not valid utf-8")?
         .to_owned();
     if path.starts_with('/') && (path.as_bytes().get(2) == Some(&b'/')) {
-        if let Some(b'a'...b'z') = path.as_bytes().get(1) {
+        if let Some(b'a'..=b'z') = path.as_bytes().get(1) {
             path.remove(0);
             path.insert(1, ':');
         }
@@ -124,13 +109,20 @@ where
     P: AsRef<Path>,
     F: FnMut(&str) -> Result<()>, {
     let path = path.as_ref();
-    let mut file = BufReader::new(
-        File::open(path).context(format_args!("failed to open file: {}", path.display()))?,
-    );
+    let mut file = BufReader::new(warn_err!(
+        File::open(path),
+        "failed to open file: {}",
+        path.display()
+    )?);
     let mut line = String::new();
     loop {
         line.clear();
-        if file.read_line(&mut line).or(Err(()))? == 0 {
+        if warn_err!(
+            file.read_line(&mut line),
+            "failed to read file: {}",
+            path.display()
+        )? == 0
+        {
             return Ok(());
         }
         f(&line)?;
@@ -145,7 +137,7 @@ where C: BorrowMut<Command> {
         .stdin(Stdio::null())
         .spawn()
         .and_then(|c| c.wait_with_output())
-        .context("failed to execute command")?;
+        .warn_err("failed to execute command")?;
     if output.status.success() {
         String::from_utf8(output.stdout).or(Err(()))
     } else {
@@ -165,7 +157,7 @@ where C: BorrowMut<Command> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: Option<String>,
-    pub root: Option<PathBuf>,
+    pub prefix: Option<PathBuf>,
     pub include_dir: HashSet<PathBuf>,
     pub lib_dir: HashSet<PathBuf>,
     pub libs: HashSet<OsString>,
@@ -176,7 +168,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: None,
-            root: None,
+            prefix: None,
             include_dir: HashSet::default(),
             lib_dir: HashSet::default(),
             libs: HashSet::default(),
@@ -186,30 +178,13 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn from_root(root: PathBuf) -> Self {
-        let mut config = Self {
-            root: Some(root.clone()),
-            ..Self::default()
-        };
-        let include = root.join("include");
-        if include.exists() {
-            config.include_dir.insert(include);
-        }
-        let lib = root.join("lib");
-        if lib.exists() {
-            config.lib_dir.insert(lib);
-        }
-        config
-    }
-
     pub fn try_detect_version(&mut self, header: &str, prefix: &str) -> Result<()> {
-        eprintln!("detecting installed version of libgcrypt");
+        eprintln!("detecting installed version...");
         let defaults = &["/usr/include".as_ref(), "/usr/local/include".as_ref()];
         for dir in self
             .include_dir
             .iter()
             .map(|x| Path::new(x))
-            .chain(self.root.iter().map(|x| x.as_ref()))
             .chain(defaults.iter().cloned())
         {
             let name = dir.join(header);
@@ -227,7 +202,14 @@ impl Config {
             let mut line = String::new();
             loop {
                 line.clear();
-                if file.read_line(&mut line).unwrap() == 0 {
+                if warn_err!(
+                    file.read_line(&mut line),
+                    "unable to read file `{}`",
+                    name.display()
+                )
+                .unwrap_or(0)
+                    == 0
+                {
                     break;
                 }
 
@@ -262,11 +244,7 @@ impl Config {
                     self.lib_dir.insert(native_path(val)?.into());
                 }
                 "-l" | "" if !val.is_empty() => {
-                    if val.ends_with(".la") {
-                        self.parse_libtool_file(native_path(val)?)?;
-                    } else {
-                        self.libs.insert(native_path(val)?.into());
-                    }
+                    self.libs.insert(native_path(val)?.into());
                 }
                 _ => (),
             }
@@ -274,38 +252,58 @@ impl Config {
         Ok(())
     }
 
-    pub fn parse_libtool_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        for_each_line(path, |l| {
-            if l.trim().starts_with("old_library") {
-                if let Some(s) = l.splitn(2, '=').nth(1) {
-                    let mut s = s.trim().trim_matches('\'');
-                    if s.ends_with(".a") {
-                        if s.starts_with("lib") {
-                            s = s.split_at(3).1;
-                        }
-                        s = s.split_at(s.len() - 2).0;
-                    }
+    pub fn write_version_macro(&self, name: &str) {
+        use std::io::Write;
 
-                    if !s.is_empty() {
-                        self.libs.insert(format!("static={}", s).into());
-                    }
-                }
-            }
-            if l.trim().starts_with("dependency_libs") {
-                if let Some(s) = l.splitn(2, '=').nth(1) {
-                    self.parse_flags(s.trim().trim_matches('\''))?
-                }
-            }
-            Ok(())
-        })
+        let (major, minor) = match self.version.as_ref().and_then(|v| {
+            let mut components = v
+                .trim()
+                .split('.')
+                .scan((), |_, x| x.parse::<u8>().ok())
+                .fuse();
+            Some((components.next()?, components.next()?))
+        }) {
+            Some(x) => x,
+            None => return,
+        };
+        let path = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("version.rs");
+        let mut output = File::create(path).unwrap();
+        writeln!(
+            output,
+            "pub const MIN_{}_VERSION: &str = \"{}.{}.0\\0\";",
+            name.to_uppercase(),
+            major,
+            minor
+        )
+        .unwrap();
+        writeln!(output, "#[macro_export]\nmacro_rules! require_{0}_ver {{\n\
+        ($ver:tt => {{ $($t:tt)*  }}) => (require_{0}_ver! {{{{ $ver => $($t)* }} else {{}} }});", name).unwrap();
+        for i in 0..=minor {
+            writeln!(
+                output,
+                "(({0},{1}) => {{ $($t:tt)* }} else {{ $($u:tt)* }}) => ($($t)*);",
+                major, i
+            )
+            .unwrap();
+        }
+        for i in 0..=major {
+            writeln!(
+                output,
+                "(({0},$ver:tt) => {{ $($t:tt)* }} else {{ $($u:tt)* }}) => ($($t)*);",
+                i
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "($ver:tt => {{ $($t:tt)* }} else {{ $($u:tt)* }}) => ($($u)*);\n}}"
+        )
+        .unwrap();
     }
 
     pub fn print(&self) {
         if let Some(ref v) = self.version {
             println!("cargo:version={}", v);
-        }
-        if let Some(ref v) = self.root {
-            println!("cargo:root={}", v.display());
         }
         if !self.include_dir.is_empty() {
             println!(
@@ -314,8 +312,6 @@ impl Config {
                     .unwrap()
                     .to_string_lossy()
             );
-        } else if let Some(ref v) = self.root {
-            println!("cargo:include={}/include", v.display())
         }
         if !self.lib_dir.is_empty() {
             println!(
@@ -325,8 +321,6 @@ impl Config {
             for dir in &self.lib_dir {
                 println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
             }
-        } else if let Some(ref v) = self.root {
-            println!("cargo:rustc-link-search=native={}/lib", v.display())
         }
         if !self.libs.is_empty() {
             println!(
@@ -351,7 +345,6 @@ pub struct Project {
     pub name: String,
     pub prefix: String,
     pub links: Option<String>,
-    pub compiler: cc::Tool,
     pub host: String,
     pub target: String,
     pub out_dir: PathBuf,
@@ -369,7 +362,6 @@ impl Default for Project {
         };
         let prefix = make_env_name(&name);
         let links = env::var("CARGO_MANIFEST_LINKS").ok();
-        let compiler = cc::Build::new().get_compiler();
         let host = env::var("HOST").unwrap();
         let target = env::var("TARGET").unwrap();
         let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -377,7 +369,6 @@ impl Default for Project {
             name,
             prefix,
             links,
-            compiler,
             host,
             target,
             out_dir,
@@ -386,29 +377,17 @@ impl Default for Project {
 }
 
 impl Project {
-    pub fn configure<F: FnOnce(&Self) -> Result<Config>>(&self, f: F) {
-        match f(self) {
-            Ok(cfg) => cfg.print(),
-            Err(_) => process::exit(1),
-        }
-    }
-
     pub fn try_env(&self) -> Result<Config> {
-        let include_dir = get_env(self.prefix.clone() + "_INCLUDE");
-        let lib_dir = get_env(self.prefix.clone() + "_LIB_DIR");
+        let prefix = get_env(self.prefix.clone() + "_PREFIX").map(PathBuf::from);
+        let include_dir = get_env(self.prefix.clone() + "_INCLUDE")
+            .or_else(|| prefix.as_ref().map(|x| x.join("include").into()));
+        let lib_dir = get_env(self.prefix.clone() + "_LIB_DIR")
+            .or_else(|| prefix.as_ref().map(|x| x.join("lib").into()));
         let libs = get_env(self.prefix.clone() + "_LIBS");
         if libs.is_some() || lib_dir.is_some() {
             let statik = get_env(self.prefix.clone() + "_STATIC").map_or(false, |s| is_truthy(s));
-            let include_dir = include_dir
-                .iter()
-                .flat_map(env::split_paths)
-                .map(|x| x.into())
-                .collect();
-            let lib_dir = lib_dir
-                .iter()
-                .flat_map(env::split_paths)
-                .map(|x| x.into())
-                .collect();
+            let include_dir = include_dir.iter().flat_map(env::split_paths).collect();
+            let lib_dir = lib_dir.iter().flat_map(env::split_paths).collect();
             let libs = libs
                 .as_ref()
                 .map(|s| &**s)
@@ -416,6 +395,7 @@ impl Project {
                 .unwrap_or(self.name.as_ref());
             let libs = env::split_paths(libs).map(|x| x.into()).collect();
             Ok(Config {
+                prefix,
                 include_dir,
                 lib_dir,
                 libs,
@@ -433,90 +413,5 @@ impl Project {
         let mut config = Config::default();
         config.parse_flags(&output)?;
         Ok(config)
-    }
-
-    pub fn try_build<F>(&self, f: F) -> Result<Config>
-    where F: FnOnce(&Self) -> Result<Config> {
-        if get_env(self.prefix.clone() + "_USE_BUNDLED")
-            .map_or(cfg!(feature = "bundled"), |s| is_truthy(s))
-        {
-            let _ = run(Command::new("git").args(&["submodule", "update", "--init"]));
-
-            if let r @ Ok(_) = f(self) {
-                return r;
-            }
-        }
-        Err(())
-    }
-
-    pub fn new_build<S: AsRef<OsStr>>(&self, name: S) -> Result<Build> {
-        Build::new(self, name)
-    }
-}
-
-pub struct Build<'a> {
-    pub project: &'a Project,
-    pub src: PathBuf,
-    pub build: PathBuf,
-}
-
-impl<'a> Build<'a> {
-    pub fn new<S: AsRef<OsStr>>(project: &'a Project, name: S) -> Result<Self> {
-        let src = PathBuf::from(env::current_dir().unwrap()).join(name.as_ref());
-        let mut build = project.out_dir.join("build");
-        build.push(name.as_ref());
-
-        fs::create_dir_all(&build).context("unable to create build directory")?;
-
-        Ok(Self {
-            project,
-            src,
-            build,
-        })
-    }
-
-    pub fn config(&self) -> Config {
-        Config::from_root(self.project.out_dir.clone().into())
-    }
-
-    pub fn configure_cmd(&self) -> Result<Command> {
-        let mut cmd = Command::new("sh");
-        let mut cc = self.project.compiler.cc_env();
-        if cc.is_empty() {
-            cc = self.project.compiler.path().as_os_str().to_owned();
-        }
-        cmd.current_dir(&self.build)
-            .env("CC", cc)
-            .env("CFLAGS", self.project.compiler.cflags_env())
-            .arg(msys_path(self.src.join("configure"))?);
-        cmd.arg("--build").arg(gnu_target(&self.project.host));
-        if self.project.host != self.project.target {
-            cmd.arg("--host").arg(gnu_target(&self.project.target));
-        }
-        cmd.arg("--disable-dependency-tracking");
-        cmd.arg("--enable-static");
-        cmd.arg("--disable-shared");
-        cmd.arg("--with-pic");
-        cmd.arg({
-            let mut s = OsString::from("--prefix=");
-            s.push(msys_path(&self.project.out_dir)?);
-            s
-        });
-        Ok(cmd)
-    }
-
-    pub fn make_cmd(&self) -> Command {
-        let name = if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
-            "gmake"
-        } else {
-            "make"
-        };
-        let mut cmd = Command::new(name);
-        cmd.env_remove("DESTDIR");
-        if cfg!(windows) {
-            cmd.env_remove("MAKEFLAGS").env_remove("MFLAGS");
-        }
-        cmd.current_dir(&self.build);
-        cmd
     }
 }
