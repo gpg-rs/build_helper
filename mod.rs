@@ -277,7 +277,7 @@ impl Config {
         )
         .unwrap();
         writeln!(output, "#[macro_export]\nmacro_rules! require_{0}_ver {{\n\
-        ($ver:tt => {{ $($t:tt)*  }}) => (require_{0}_ver! {{{{ $ver => $($t)* }} else {{}} }});", name).unwrap();
+        ($ver:tt => {{ $($t:tt)*  }}) => (require_{0}_ver! {{ $ver => {{ $($t)* }} else {{}} }});", name).unwrap();
         for i in 0..=minor {
             writeln!(
                 output,
