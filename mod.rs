@@ -286,7 +286,7 @@ impl Config {
             )
             .unwrap();
         }
-        for i in 0..=major {
+        for i in 0..major {
             writeln!(
                 output,
                 "(({0},$ver:tt) => {{ $($t:tt)* }} else {{ $($u:tt)* }}) => ($($t)*);",
