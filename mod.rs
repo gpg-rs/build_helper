@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-#![allow(unused_macros)]
+#![allow(dead_code, unused_macros)]
 use std::{
     borrow::BorrowMut,
     collections::HashSet,
@@ -93,42 +92,6 @@ pub fn native_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     Ok(path.into())
 }
 
-pub fn gnu_target(target: &str) -> String {
-    match target {
-        "i686-pc-windows-gnu" => "i686-w64-mingw32".to_string(),
-        "x86_64-pc-windows-gnu" => "x86_64-w64-mingw32".to_string(),
-        s if s.starts_with("i686-unknown") || s.starts_with("x86_64-unknown") => {
-            s.replacen("unknown", "pc", 1)
-        }
-        s => s.to_string(),
-    }
-}
-
-pub fn for_each_line<P, F>(path: P, mut f: F) -> Result<()>
-where
-    P: AsRef<Path>,
-    F: FnMut(&str) -> Result<()>, {
-    let path = path.as_ref();
-    let mut file = BufReader::new(warn_err!(
-        File::open(path),
-        "failed to open file: {}",
-        path.display()
-    )?);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if warn_err!(
-            file.read_line(&mut line),
-            "failed to read file: {}",
-            path.display()
-        )? == 0
-        {
-            return Ok(());
-        }
-        f(&line)?;
-    }
-}
-
 pub fn run<C>(mut cmd: C) -> Result<String>
 where C: BorrowMut<Command> {
     let cmd = cmd.borrow_mut();
@@ -184,11 +147,11 @@ impl Config {
         for dir in self
             .include_dir
             .iter()
-            .map(|x| Path::new(x))
+            .map(Path::new)
             .chain(defaults.iter().cloned())
         {
             let name = dir.join(header);
-            let mut file = match File::open(name.clone()) {
+            let file = match File::open(name.clone()) {
                 Ok(f) => BufReader::new(f),
                 Err(e) => {
                     if e.kind() == io::ErrorKind::NotFound {
@@ -199,20 +162,11 @@ impl Config {
                     continue;
                 }
             };
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if warn_err!(
-                    file.read_line(&mut line),
-                    "unable to read file `{}`",
-                    name.display()
-                )
-                .unwrap_or(0)
-                    == 0
-                {
-                    break;
-                }
-
+            for line in file.lines() {
+                let line = match warn_err!(line, "unable to read file '{}'", name.display()) {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
                 if let Some(p) = line.find(prefix) {
                     if let Some(v) = (&line[p..]).split('\"').nth(1) {
                         eprintln!("found version: {} in {}", v, name.display());
@@ -255,17 +209,21 @@ impl Config {
     pub fn write_version_macro(&self, name: &str) {
         use std::io::Write;
 
-        let (major, minor) = match self.version.as_ref().and_then(|v| {
-            let mut components = v
-                .trim()
-                .split('.')
-                .scan((), |_, x| x.parse::<u8>().ok())
-                .fuse();
-            Some((components.next()?, components.next()?))
-        }) {
-            Some(x) => x,
-            None => return,
-        };
+        // TODO: refactor this to improve clarity and robustness
+        let (major, minor) = self
+            .version
+            .as_ref()
+            .and_then(|v| {
+                v.trim()
+                    .splitn(2, |c: char| (c != '.') && !c.is_digit(10))
+                    .next()
+                    .and_then(|v| {
+                        let mut components =
+                            v.split('.').scan((), |_, x| x.parse::<u8>().ok()).fuse();
+                        Some((components.next()?, components.next()?))
+                    })
+            })
+            .expect("cannot parse version");
         let path = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("version.rs");
         let mut output = File::create(path).unwrap();
         writeln!(
