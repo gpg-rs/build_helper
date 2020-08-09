@@ -67,31 +67,6 @@ pub fn is_truthy<S: AsRef<OsStr>>(value: S) -> bool {
         && !s.eq_ignore_ascii_case("off")
 }
 
-pub fn make_env_name<S: AsRef<str>>(value: S) -> String {
-    let mut value = value.as_ref().replace('-', "_");
-    value.make_ascii_uppercase();
-    value
-}
-
-pub fn native_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
-    if !cfg!(windows) {
-        return Ok(path.as_ref().to_owned());
-    }
-
-    let mut path = path
-        .as_ref()
-        .to_str()
-        .warn_err("path is not valid utf-8")?
-        .to_owned();
-    if path.starts_with('/') && (path.as_bytes().get(2) == Some(&b'/')) {
-        if let Some(b'a'..=b'z') = path.as_bytes().get(1) {
-            path.remove(0);
-            path.insert(1, ':');
-        }
-    }
-    Ok(path.into())
-}
-
 pub fn run<C>(mut cmd: C) -> Result<String>
 where C: BorrowMut<Command> {
     let cmd = cmd.borrow_mut();
@@ -115,6 +90,87 @@ where C: BorrowMut<Command> {
 pub fn output<C>(mut cmd: C) -> Result<String>
 where C: BorrowMut<Command> {
     run(cmd.borrow_mut().stdout(Stdio::piped()))
+}
+
+pub struct Project {
+    pub name: String,
+    pub prefix: String,
+    pub links: String,
+    pub host: String,
+    pub target: String,
+    pub out_dir: PathBuf,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        let name = {
+            let mut name = env::var("CARGO_PKG_NAME").unwrap();
+            if name.ends_with("-sys") {
+                let len = name.len() - 4;
+                name.truncate(len);
+            }
+            name
+        };
+        let prefix = {
+            let mut prefix = name.replace('-', "_");
+            prefix.make_ascii_uppercase();
+            prefix
+        };
+        let links = env::var("CARGO_MANIFEST_LINKS").ok().unwrap_or_else(|| {
+            if name.starts_with("lib") {
+                String::from(&name[3..])
+            } else {
+                name.clone()
+            }
+        });
+        let host = env::var("HOST").unwrap();
+        let target = env::var("TARGET").unwrap();
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        Self {
+            name,
+            prefix,
+            links,
+            host,
+            target,
+            out_dir,
+        }
+    }
+}
+
+impl Project {
+    pub fn try_env(&self) -> Result<Config> {
+        let prefix = get_env(self.prefix.clone() + "_PREFIX").map(PathBuf::from);
+        let include_dir = get_env(self.prefix.clone() + "_INCLUDE")
+            .or_else(|| prefix.as_ref().map(|x| x.join("include").into()));
+        let lib_dir = get_env(self.prefix.clone() + "_LIB_DIR")
+            .or_else(|| prefix.as_ref().map(|x| x.join("lib").into()));
+        let libs = get_env(self.prefix.clone() + "_LIBS");
+        if libs.is_some() || lib_dir.is_some() {
+            let statik = get_env(self.prefix.clone() + "_STATIC").map_or(false, |s| is_truthy(s));
+            let include_dir = include_dir.iter().flat_map(env::split_paths).collect();
+            let lib_dir = lib_dir.iter().flat_map(env::split_paths).collect();
+            let libs = libs.as_ref().map(|s| &**s).unwrap_or(self.links.as_ref());
+            let libs = env::split_paths(libs).map(|x| x.into()).collect();
+            Ok(Config {
+                prefix,
+                include_dir,
+                lib_dir,
+                libs,
+                statik,
+                ..Config::default()
+            })
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn try_config<C>(&self, cmd: C) -> Result<Config>
+    where C: BorrowMut<Command> {
+        let output = output(cmd)?;
+        let mut config = Config::default();
+        config.parse_flags(&output)?;
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +233,7 @@ impl Config {
                 }
             }
         }
+        eprintln!("unable to detect version!");
         Err(())
     }
 
@@ -192,13 +249,13 @@ impl Config {
         for (flag, val) in parts {
             match flag {
                 "-I" => {
-                    self.include_dir.insert(native_path(val)?.into());
+                    self.include_dir.insert(val.into());
                 }
                 "-L" => {
-                    self.lib_dir.insert(native_path(val)?.into());
+                    self.lib_dir.insert(val.into());
                 }
                 "-l" | "" if !val.is_empty() => {
-                    self.libs.insert(native_path(val)?.into());
+                    self.libs.insert(val.into());
                 }
                 _ => (),
             }
@@ -234,8 +291,13 @@ impl Config {
             minor
         )
         .unwrap();
-        writeln!(output, "#[macro_export]\nmacro_rules! require_{0}_ver {{\n\
-        ($ver:tt => {{ $($t:tt)*  }}) => (require_{0}_ver! {{ $ver => {{ $($t)* }} else {{}} }});", name).unwrap();
+        writeln!(
+            output,
+            "#[macro_export]\nmacro_rules! require_{0}_ver {{\n\
+        ($ver:tt => {{ $($t:tt)*  }}) => (require_{0}_ver! {{ $ver => {{ $($t)* }} else {{}} }});",
+            name
+        )
+        .unwrap();
         for i in 0..=minor {
             writeln!(
                 output,
@@ -296,80 +358,5 @@ impl Config {
                 println!("cargo:rustc-link-lib={}{}", mode, lib)
             }
         }
-    }
-}
-
-pub struct Project {
-    pub name: String,
-    pub prefix: String,
-    pub links: Option<String>,
-    pub host: String,
-    pub target: String,
-    pub out_dir: PathBuf,
-}
-
-impl Default for Project {
-    fn default() -> Self {
-        let name = {
-            let mut name = env::var("CARGO_PKG_NAME").unwrap();
-            if name.ends_with("-sys") {
-                let len = name.len() - 4;
-                name.truncate(len);
-            }
-            name
-        };
-        let prefix = make_env_name(&name);
-        let links = env::var("CARGO_MANIFEST_LINKS").ok();
-        let host = env::var("HOST").unwrap();
-        let target = env::var("TARGET").unwrap();
-        let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-        Self {
-            name,
-            prefix,
-            links,
-            host,
-            target,
-            out_dir,
-        }
-    }
-}
-
-impl Project {
-    pub fn try_env(&self) -> Result<Config> {
-        let prefix = get_env(self.prefix.clone() + "_PREFIX").map(PathBuf::from);
-        let include_dir = get_env(self.prefix.clone() + "_INCLUDE")
-            .or_else(|| prefix.as_ref().map(|x| x.join("include").into()));
-        let lib_dir = get_env(self.prefix.clone() + "_LIB_DIR")
-            .or_else(|| prefix.as_ref().map(|x| x.join("lib").into()));
-        let libs = get_env(self.prefix.clone() + "_LIBS");
-        if libs.is_some() || lib_dir.is_some() {
-            let statik = get_env(self.prefix.clone() + "_STATIC").map_or(false, |s| is_truthy(s));
-            let include_dir = include_dir.iter().flat_map(env::split_paths).collect();
-            let lib_dir = lib_dir.iter().flat_map(env::split_paths).collect();
-            let libs = libs
-                .as_ref()
-                .map(|s| &**s)
-                .or_else(|| self.links.as_ref().map(|s| s.as_ref()))
-                .unwrap_or(self.name.as_ref());
-            let libs = env::split_paths(libs).map(|x| x.into()).collect();
-            Ok(Config {
-                prefix,
-                include_dir,
-                lib_dir,
-                libs,
-                statik,
-                ..Config::default()
-            })
-        } else {
-            Err(())
-        }
-    }
-
-    pub fn try_config<C>(&self, cmd: C) -> Result<Config>
-    where C: BorrowMut<Command> {
-        let output = output(cmd)?;
-        let mut config = Config::default();
-        config.parse_flags(&output)?;
-        Ok(config)
     }
 }
